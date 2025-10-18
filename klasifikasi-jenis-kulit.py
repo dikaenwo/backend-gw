@@ -1,11 +1,16 @@
 from flask import Flask, request, jsonify
+import os
+
+# Force TensorFlow pakai CPU saja (sebelum import tensorflow)
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Kurangi log TensorFlow
+
 import tensorflow as tf
 from tensorflow.keras.layers import DepthwiseConv2D
 from tensorflow.keras.preprocessing import image
 import numpy as np
 from PIL import Image
 import io
-import os
 
 app = Flask(__name__)
 
@@ -39,24 +44,93 @@ skin_problems = {
     'Normal': ['Kulit Kusam', 'Dehidrasi Ringan']
 }
 
-# Load model dengan error handling yang lebih baik
-try:
-    print("Memuat model...")
-    if os.path.exists(model_path):
-        # Coba load dengan compile=False untuk menghindari masalah layer
+def load_model_safe():
+    """Load model dengan berbagai metode fallback"""
+    global inference_model
+    
+    if not os.path.exists(model_path):
+        print(f"❌ File model '{model_path}' tidak ditemukan!")
+        return False
+    
+    # Metode 1: Load dengan compile=False
+    print("🔄 Mencoba metode 1: load_model dengan compile=False...")
+    try:
         inference_model = tf.keras.models.load_model(
             model_path,
             custom_objects={'DepthwiseConv2D': PatchedDepthwiseConv2D},
-            compile=False  # ← FIX UTAMA: Tidak compile model saat load
+            compile=False
         )
-        print(f"✅ Model '{model_path}' berhasil dimuat.")
-        print(f"   Input shape: {inference_model.input_shape}")
-        print(f"   Output shape: {inference_model.output_shape}")
-    else:
-        print(f"❌ Model '{model_path}' tidak ditemukan.")
-except Exception as e:
-    print(f"❌ Gagal memuat model: {e}")
-    print("   Coba alternatif: save model sebagai SavedModel format atau load weights saja")
+        print(f"✅ Model berhasil dimuat (metode 1)")
+        return True
+    except Exception as e:
+        print(f"❌ Metode 1 gagal: {str(e)[:100]}")
+    
+    # Metode 2: Load dengan safe_mode=False (TF 2.16+)
+    print("🔄 Mencoba metode 2: safe_mode=False...")
+    try:
+        inference_model = tf.keras.models.load_model(
+            model_path,
+            custom_objects={'DepthwiseConv2D': PatchedDepthwiseConv2D},
+            compile=False,
+            safe_mode=False
+        )
+        print(f"✅ Model berhasil dimuat (metode 2)")
+        return True
+    except Exception as e:
+        print(f"❌ Metode 2 gagal: {str(e)[:100]}")
+    
+    # Metode 3: Load model architecture dan weights terpisah
+    print("🔄 Mencoba metode 3: load weights saja...")
+    try:
+        # Coba buat model dari scratch (perlu tahu arsitektur aslinya)
+        from tensorflow.keras.applications import MobileNetV2
+        from tensorflow.keras.models import Model
+        from tensorflow.keras.layers import GlobalAveragePooling2D, Dense
+        
+        base_model = MobileNetV2(
+            input_shape=(224, 224, 3),
+            include_top=False,
+            weights=None
+        )
+        x = base_model.output
+        x = GlobalAveragePooling2D()(x)
+        predictions = Dense(4, activation='softmax')(x)
+        inference_model = Model(inputs=base_model.input, outputs=predictions)
+        
+        # Load weights
+        inference_model.load_weights(model_path)
+        print(f"✅ Model berhasil dimuat (metode 3 - weights only)")
+        return True
+    except Exception as e:
+        print(f"❌ Metode 3 gagal: {str(e)[:100]}")
+    
+    print("\n" + "="*60)
+    print("❌ SEMUA METODE GAGAL!")
+    print("="*60)
+    print("\n📋 SOLUSI:")
+    print("1. Hubungi tim yang training model")
+    print("2. Minta file model dalam format SavedModel (folder, bukan .h5)")
+    print("3. Atau minta file .weights.h5 + script arsitektur model")
+    print("4. Atau re-save model dengan: model.save('model_bglow', save_format='tf')")
+    print("\n")
+    
+    return False
+
+# Load model saat startup
+print("\n" + "="*60)
+print("🚀 Memulai BGlow API Server")
+print("="*60)
+print(f"📦 TensorFlow Version: {tf.__version__}")
+print(f"🖥️  Device: CPU Only (VPS Mode)")
+print(f"📁 Model Path: {model_path}")
+print("="*60 + "\n")
+
+if load_model_safe():
+    print(f"   Input shape: {inference_model.input_shape}")
+    print(f"   Output shape: {inference_model.output_shape}")
+    print(f"   Classes: {class_names}\n")
+else:
+    print("⚠️  Server akan tetap jalan, tapi endpoint /predict tidak akan berfungsi\n")
 
 def predict_image(img_bytes):
     """Fungsi untuk memprediksi jenis kulit dari bytes gambar"""
@@ -79,8 +153,7 @@ def predict_image(img_bytes):
         img_array = image.img_to_array(img)
         img_array_expanded = np.expand_dims(img_array, axis=0)
         
-        # Normalisasi jika model ditraining dengan normalisasi
-        # Uncomment jika diperlukan:
+        # Normalisasi (uncomment jika model ditraining dengan normalisasi)
         # img_array_expanded = img_array_expanded / 255.0
         
         # Prediksi
@@ -92,7 +165,7 @@ def predict_image(img_bytes):
         confidence = float(np.max(predictions[0]) * 100)
         
         # Log prediksi
-        print(f"   Prediksi: {predicted_class} ({confidence:.2f}%)")
+        print(f"   ✅ Prediksi: {predicted_class} ({confidence:.2f}%)")
         
         return predicted_class, confidence
     except Exception as e:
@@ -103,7 +176,8 @@ def home():
     return jsonify({
         'status': 'success',
         'message': 'BGlow Skin Analysis API',
-        'version': '1.0',
+        'version': '1.1',
+        'model_loaded': inference_model is not None,
         'endpoints': {
             '/': 'GET - API information',
             '/health': 'GET - Check API health status',
@@ -128,7 +202,8 @@ def health():
         'model_status': model_status,
         'available_classes': class_names,
         'model_info': model_info,
-        'image_size': IMG_SIZE
+        'image_size': IMG_SIZE,
+        'tensorflow_version': tf.__version__
     })
 
 @app.route('/predict', methods=['POST'])
@@ -139,7 +214,8 @@ def predict():
         if inference_model is None:
             return jsonify({
                 'status': 'error',
-                'message': 'Model belum dimuat. Periksa log server untuk detail error.'
+                'message': 'Model gagal dimuat saat startup. Cek log server untuk detail.',
+                'solution': 'Hubungi developer untuk mendapatkan model yang kompatibel'
             }), 500
         
         # Validasi ada file yang diupload
@@ -198,10 +274,4 @@ def predict():
 
 if __name__ == '__main__':
     # Jalankan server
-    # Untuk production, gunakan gunicorn atau waitress
-    print("\n🚀 Starting BGlow API Server...")
-    print(f"   Model: {model_path}")
-    print(f"   Classes: {class_names}")
-    print(f"   Image Size: {IMG_SIZE}\n")
-    
     app.run(host='0.0.0.0', port=5000, debug=True)
